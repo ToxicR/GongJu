@@ -1,0 +1,4 @@
+customtkinter>=5.2.0
+pillow>=10.0.0
+# 可选：pip install PyDroidCTRL 后可用视频流投屏（需本机已安装 scrcpy）
+# PyDroidCTRL>=1.2.0
