@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('bundled/platform-tools', 'bundled/platform-tools')],
+    datas=[('bundled/platform-tools', 'bundled/platform-tools'), ('bundled/scrcpy', 'bundled/scrcpy')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -23,7 +23,8 @@ class MainApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("工具软件")
-        self.geometry("480x400")
+        self.geometry("620x520")
+        self.minsize(560, 480)
         self.resizable(True, True)
         if os.path.isfile(_ICON_PATH):
             try:
@@ -37,66 +38,66 @@ class MainApp(ctk.CTk):
         title = ctk.CTkLabel(
             self,
             text="请选择要使用的功能",
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=ctk.CTkFont(size=24, weight="bold"),
         )
-        title.pack(pady=(32, 24))
+        title.pack(pady=(42, 30))
 
         # 功能按钮容器
         frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=40, pady=20)
+        frame.pack(fill="both", expand=True, padx=60, pady=24)
 
         # 1. 日志输出功能
         btn_log = ctk.CTkButton(
             frame,
             text="1. 日志输出功能",
-            font=ctk.CTkFont(size=16),
-            height=48,
-            width=320,
+            font=ctk.CTkFont(size=18),
+            height=58,
+            width=420,
             command=self._open_log_viewer,
         )
-        btn_log.pack(pady=12)
+        btn_log.pack(pady=14)
 
         # 2. ADB 文件浏览器
         btn_files = ctk.CTkButton(
             frame,
             text="2. ADB 文件浏览器",
-            font=ctk.CTkFont(size=16),
-            height=48,
-            width=320,
+            font=ctk.CTkFont(size=18),
+            height=58,
+            width=420,
             command=self._open_file_browser,
         )
-        btn_files.pack(pady=12)
+        btn_files.pack(pady=14)
 
         # 3. 投屏
         btn_mirror = ctk.CTkButton(
             frame,
             text="3. 投屏",
-            font=ctk.CTkFont(size=16),
-            height=48,
-            width=320,
+            font=ctk.CTkFont(size=18),
+            height=58,
+            width=420,
             command=self._open_screen_mirror,
         )
-        btn_mirror.pack(pady=12)
+        btn_mirror.pack(pady=14)
 
         # 4. ADB 环境安装
         btn_adb_install = ctk.CTkButton(
             frame,
             text="4. ADB 环境安装",
-            font=ctk.CTkFont(size=16),
-            height=48,
-            width=320,
+            font=ctk.CTkFont(size=18),
+            height=58,
+            width=420,
             command=self._open_adb_installer,
         )
-        btn_adb_install.pack(pady=12)
+        btn_adb_install.pack(pady=14)
 
         # 预留更多功能入口
         hint = ctk.CTkLabel(
             frame,
             text="更多功能敬请期待",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=13),
             text_color="gray",
         )
-        hint.pack(pady=8)
+        hint.pack(pady=10)
 
     def _open_log_viewer(self):
         """打开 Android 日志输出窗口"""

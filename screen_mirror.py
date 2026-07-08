@@ -1,80 +1,111 @@
 # -*- coding: utf-8 -*-
 """
-Android 投屏模块
-优先使用 PyDroidCTRL + scrcpy 视频流（流畅）；未安装时回退到 ADB 截屏预览。
-参考: https://pypi.org/project/PyDroidCTRL/
+Android 投屏模块。
+
+把 scrcpy 原生窗口嵌入到软件内，视频解码和输入控制交给 scrcpy。
 """
-import asyncio
-import io
+import ctypes
 import os
-import queue
 import re
 import subprocess
 import sys
-import threading
 import time
+import uuid
+from ctypes import wintypes
 
 import customtkinter as ctk
-from tkinter import messagebox, Canvas
-from PIL import Image, ImageTk
+from tkinter import Canvas, messagebox
 
-from log_viewer import find_adb, check_android_device
+from log_viewer import check_android_device, find_adb
 
 _CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-_PREVIEW_FPS = 8
-_POLL_MS = 50
 
-# 可选：PyDroidCTRL（需 pip install PyDroidCTRL，且本机已安装 scrcpy）
-# 官方示例: from android_controller import Controller
-try:
-    from android_controller import Controller as PyDroidController
-except ImportError:
-    try:
-        from PyDroidCTRL.android_controller import Controller as PyDroidController
-    except ImportError:
-        PyDroidController = None
+_SCRCPY_MAX_SIZE = "1280"
+_SCRCPY_MAX_FPS = "60"
+_SCRCPY_DEFAULT_BIT_RATE = "8M"
+_SCRCPY_BIT_RATE_OPTIONS = ["4M", "8M", "12M", "16M", "24M"]
+_SCRCPY_EMBED_TIMEOUT = 8.0
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM) if sys.platform == "win32" else None
+
+
+def _app_base_dir():
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _adb_serial_args(serial):
+    return ["-s", serial] if serial else []
+
+
+def _run_no_window(args, **kwargs):
+    return subprocess.run(args, creationflags=_CREATIONFLAGS, **kwargs)
 
 
 def find_scrcpy():
-    """查找本机 scrcpy 可执行文件路径"""
+    """查找本机 scrcpy 可执行文件。"""
+    candidates = []
+    if sys.platform == "win32":
+        base = _app_base_dir()
+        candidates.extend(
+            [
+                os.path.join(base, "scrcpy.exe"),
+                os.path.join(base, "bundled", "scrcpy", "scrcpy.exe"),
+                os.path.join(os.path.dirname(base), "scrcpy", "scrcpy.exe"),
+                os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "scrcpy", "scrcpy.exe"),
+                os.path.join(os.path.expanduser("~"), "scoop", "apps", "scrcpy", "current", "scrcpy.exe"),
+            ]
+        )
+
     names = ["scrcpy.exe", "scrcpy"] if sys.platform == "win32" else ["scrcpy"]
     for name in names:
         try:
-            r = subprocess.run(
+            r = _run_no_window(
                 [name, "--version"],
                 capture_output=True,
                 text=True,
                 timeout=5,
-                creationflags=_CREATIONFLAGS,
             )
             if r.returncode == 0 or "scrcpy" in (r.stdout or r.stderr or "").lower():
                 return name
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    if sys.platform == "win32":
-        for base in [
-            os.path.expandvars(r"%LOCALAPPDATA%"),
-            os.path.expanduser("~"),
-        ]:
-            for rel in [
-                os.path.join("scoop", "apps", "scrcpy", "current", "scrcpy.exe"),
-                os.path.join("scrcpy", "scrcpy.exe"),
-            ]:
-                path = os.path.join(base, rel)
-                if os.path.isfile(path):
-                    return path
+            pass
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
     return None
 
 
-def get_device_size(adb_cmd):
-    """获取设备分辨率 (width, height)"""
+def get_connected_serials(adb_cmd):
+    """返回 adb devices 中状态为 device 的设备序列号。"""
     try:
-        r = subprocess.run(
-            [adb_cmd, "shell", "wm", "size"],
+        r = _run_no_window(
+            [adb_cmd, "devices"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if r.returncode != 0:
+            return []
+        serials = []
+        for line in (r.stdout or "").splitlines()[1:]:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == "device":
+                serials.append(parts[0])
+        return serials
+    except Exception:
+        return []
+
+
+def get_device_size(adb_cmd, serial=None):
+    """获取设备分辨率 (width, height)。"""
+    try:
+        r = _run_no_window(
+            [adb_cmd] + _adb_serial_args(serial) + ["shell", "wm", "size"],
             capture_output=True,
             text=True,
             timeout=5,
-            creationflags=_CREATIONFLAGS,
         )
         if r.returncode != 0:
             return None
@@ -86,93 +117,134 @@ def get_device_size(adb_cmd):
     return None
 
 
-def capture_one_png(adb_cmd):
-    """执行一次 PNG 截屏，返回 (PIL.Image, width, height) 或 None"""
-    try:
-        r = subprocess.run(
-            [adb_cmd, "exec-out", "screencap", "-p"],
-            capture_output=True,
-            timeout=8,
-            creationflags=_CREATIONFLAGS,
+class _Win32WindowEmbedder:
+    """把外部顶层窗口重设为指定 HWND 的子窗口。"""
+
+    GWL_STYLE = -16
+    WS_CHILD = 0x40000000
+    WS_VISIBLE = 0x10000000
+    WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
+    WS_MINIMIZE = 0x20000000
+    WS_MAXIMIZE = 0x01000000
+    WS_SYSMENU = 0x00080000
+    SWP_NOZORDER = 0x0004
+    SWP_FRAMECHANGED = 0x0020
+
+    def __init__(self):
+        if sys.platform != "win32":
+            raise RuntimeError("嵌入式 scrcpy 目前只支持 Windows")
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._setup_signatures()
+
+    def _setup_signatures(self):
+        self.user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+        self.user32.EnumWindows.restype = wintypes.BOOL
+        self.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        self.user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        self.user32.GetWindowTextLengthW.restype = ctypes.c_int
+        self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        self.user32.GetWindowTextW.restype = ctypes.c_int
+        self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        self.user32.IsWindowVisible.restype = wintypes.BOOL
+        self.user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+        self.user32.SetParent.restype = wintypes.HWND
+        self.user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+        self.user32.MoveWindow.restype = wintypes.BOOL
+        self.user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        self.user32.SetWindowPos.restype = wintypes.BOOL
+
+        if hasattr(self.user32, "GetWindowLongPtrW"):
+            self._get_window_long = self.user32.GetWindowLongPtrW
+            self._set_window_long = self.user32.SetWindowLongPtrW
+        else:
+            self._get_window_long = self.user32.GetWindowLongW
+            self._set_window_long = self.user32.SetWindowLongW
+        self._get_window_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        self._get_window_long.restype = ctypes.c_void_p
+        self._set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        self._set_window_long.restype = ctypes.c_void_p
+
+    def find_window(self, pid, title):
+        found = []
+
+        def callback(hwnd, _):
+            window_pid = wintypes.DWORD()
+            self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if window_pid.value != pid or not self.user32.IsWindowVisible(hwnd):
+                return True
+            length = self.user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            self.user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value == title:
+                found.append(hwnd)
+                return False
+            return True
+
+        enum_proc = _WNDENUMPROC(callback)
+        self.user32.EnumWindows(enum_proc, 0)
+        return found[0] if found else None
+
+    def embed(self, child_hwnd, parent_hwnd, width, height):
+        style = int(self._get_window_long(child_hwnd, self.GWL_STYLE) or 0)
+        style |= self.WS_CHILD | self.WS_VISIBLE
+        style &= ~(self.WS_CAPTION | self.WS_THICKFRAME | self.WS_MINIMIZE | self.WS_MAXIMIZE | self.WS_SYSMENU)
+        self._set_window_long(child_hwnd, self.GWL_STYLE, ctypes.c_void_p(style))
+        self.user32.SetParent(child_hwnd, parent_hwnd)
+        self.resize(child_hwnd, width, height)
+
+    def resize(self, child_hwnd, width, height):
+        width = max(1, int(width))
+        height = max(1, int(height))
+        self.user32.SetWindowPos(
+            child_hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            self.SWP_NOZORDER | self.SWP_FRAMECHANGED,
         )
-        if r.returncode != 0 or not r.stdout:
-            return None
-        img = Image.open(io.BytesIO(r.stdout)).convert("RGB")
-        w, h = img.size
-        return (img, w, h)
-    except Exception:
-        return None
-
-
-def send_tap(adb_cmd, x, y):
-    """在设备上执行点击 (x, y)"""
-    if not adb_cmd:
-        return False
-    try:
-        r = subprocess.run(
-            [adb_cmd, "shell", "input", "tap", str(int(x)), str(int(y))],
-            capture_output=True,
-            timeout=5,
-            creationflags=_CREATIONFLAGS,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _run_pydroid_stream(adb_path, scrcpy_path):
-    """在后台线程中运行 PyDroidCTRL 的 scrcpy 视频流"""
-    async def _stream():
-        try:
-            controller = PyDroidController(adb_path=adb_path, scrcpy_path=scrcpy_path)
-            await controller.stream(
-                max_fps=30,
-                bit_rate="8M",
-                rotate=False,
-                always_on_top=False,
-                disable_screensaver=True,
-                no_audio=True,
-            )
-        except Exception:
-            pass
-
-    try:
-        asyncio.run(_stream())
-    except Exception:
-        pass
+        self.user32.MoveWindow(child_hwnd, 0, 0, width, height, True)
 
 
 class ScreenMirrorWindow(ctk.CTkToplevel):
-    """投屏窗口：可选 PyDroidCTRL 视频流（scrcpy）或截屏预览"""
+    """投屏窗口：嵌入 scrcpy 视频流。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.title("Android 投屏")
         self.geometry("900x680")
         self.resizable(True, True)
-        _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-        if os.path.isfile(_icon):
+        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        if os.path.isfile(icon):
             try:
-                self.iconbitmap(_icon)
+                self.iconbitmap(icon)
             except Exception:
                 pass
 
         self._adb_cmd = None
+        self._serial = None
         self._device_size = None
-        self._running = False
-        self._thread = None
-        self._frame_queue = queue.Queue(maxsize=1)
-        self._photo = None
         self._display_w = 800
         self._display_h = 600
-        self._offset_x = 0
-        self._offset_y = 0
-        self._shown_w = 0
-        self._shown_h = 0
-        self._orig_w = 0
-        self._orig_h = 0
+
         self._scrcpy_path = find_scrcpy()
-        self._pydroid_ok = PyDroidController is not None and self._scrcpy_path is not None
+        self._scrcpy_process = None
+        self._scrcpy_hwnd = None
+        self._scrcpy_title = None
+        self._embedder = _Win32WindowEmbedder() if sys.platform == "win32" else None
+        self._bit_rate_var = ctk.StringVar(value=_SCRCPY_DEFAULT_BIT_RATE)
 
         self._build_ui()
         self._init_connection()
@@ -182,40 +254,39 @@ class ScreenMirrorWindow(ctk.CTkToplevel):
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=12, pady=8)
 
-        self._status_label = ctk.CTkLabel(top, text="正在检测设备…", font=ctk.CTkFont(size=13))
+        self._status_label = ctk.CTkLabel(top, text="正在检测设备...", font=ctk.CTkFont(size=13))
         self._status_label.pack(side="left")
 
-        # 视频流按钮（PyDroidCTRL + scrcpy）
-        self._btn_stream = ctk.CTkButton(
+        self._btn_scrcpy = ctk.CTkButton(
             top,
-            text="启动视频流投屏（scrcpy）",
-            width=180,
-            command=self._start_video_stream,
+            text="启动流畅投屏",
+            width=140,
+            command=self._toggle_scrcpy,
             state="disabled",
         )
-        self._btn_stream.pack(side="right", padx=4)
+        self._btn_scrcpy.pack(side="right", padx=4)
 
-        self._btn_toggle = ctk.CTkButton(
-            top, text="开始预览（截屏）", width=140, command=self._toggle_stream, state="disabled"
+        self._bit_rate_menu = ctk.CTkOptionMenu(
+            top,
+            values=_SCRCPY_BIT_RATE_OPTIONS,
+            variable=self._bit_rate_var,
+            width=90,
         )
-        self._btn_toggle.pack(side="right", padx=4)
+        self._bit_rate_menu.pack(side="right", padx=4)
+
+        self._bit_rate_label = ctk.CTkLabel(top, text="码率", font=ctk.CTkFont(size=13))
+        self._bit_rate_label.pack(side="right", padx=(12, 2))
 
         self._preview_frame = ctk.CTkFrame(self, fg_color=("#333", "#222"))
         self._preview_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        self._canvas = Canvas(
-            self._preview_frame,
-            bg="#1a1a1a",
-            highlightthickness=0,
-        )
+        self._canvas = Canvas(self._preview_frame, bg="#1a1a1a", highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
-
-        self._canvas.bind("<Button-1>", self._on_click)
         self._canvas.bind("<Configure>", self._on_canvas_resize)
 
         self._hint = ctk.CTkLabel(
             self._preview_frame,
-            text="使用「启动视频流投屏」可获得流畅画面（需安装 scrcpy）；或使用「开始预览」截屏方式",
+            text="点击“启动流畅投屏”后，可在此窗口内预览并控制 Android 设备。",
             font=ctk.CTkFont(size=12),
             text_color="gray",
         )
@@ -224,6 +295,8 @@ class ScreenMirrorWindow(ctk.CTkToplevel):
     def _on_canvas_resize(self, event):
         self._display_w = max(100, event.width)
         self._display_h = max(100, event.height)
+        if self._scrcpy_hwnd and self._embedder:
+            self._embedder.resize(self._scrcpy_hwnd, self._display_w, self._display_h)
 
     def _set_status(self, text):
         self._status_label.configure(text=text)
@@ -238,7 +311,8 @@ class ScreenMirrorWindow(ctk.CTkToplevel):
                 parent=self,
             )
             return
-        ok, _ = check_android_device(self._adb_cmd)
+
+        ok, msg_or_devices = check_android_device(self._adb_cmd)
         if not ok:
             self._set_status("未检测到设备")
             messagebox.showwarning(
@@ -247,138 +321,141 @@ class ScreenMirrorWindow(ctk.CTkToplevel):
                 parent=self,
             )
             return
-        self._device_size = get_device_size(self._adb_cmd)
-        self._set_status("设备已连接")
-        self._btn_toggle.configure(state="normal")
-        if self._pydroid_ok:
-            self._btn_stream.configure(state="normal")
-        else:
-            if PyDroidController is None:
-                self._set_status("设备已连接（可 pip install PyDroidCTRL 并安装 scrcpy 使用视频流）")
-            elif not self._scrcpy_path:
-                self._set_status("设备已连接（请安装 scrcpy 以使用视频流，如 winget install scrcpy）")
 
-    def _start_video_stream(self):
-        """使用 PyDroidCTRL 启动 scrcpy 视频流（独立窗口）"""
-        if not self._pydroid_ok or not self._adb_cmd or not self._scrcpy_path:
-            messagebox.showinfo(
-                "使用视频流",
-                "请先安装：\n1. pip install PyDroidCTRL\n2. scrcpy（如 winget install scrcpy）",
-                parent=self,
-            )
+        serials = get_connected_serials(self._adb_cmd)
+        self._serial = serials[0] if serials else None
+        self._device_size = get_device_size(self._adb_cmd, self._serial)
+
+        if self._scrcpy_path and self._embedder:
+            self._btn_scrcpy.configure(state="normal")
+            if len(serials) > 1:
+                self._set_status(f"已连接 {len(serials)} 台设备，默认使用 {self._serial}")
+            else:
+                self._set_status("设备已连接，可启动流畅投屏")
+        elif not self._scrcpy_path:
+            self._set_status("设备已连接；未找到 scrcpy，无法启动流畅投屏")
+        else:
+            self._set_status("设备已连接；当前系统不支持嵌入式 scrcpy")
+
+    def _toggle_scrcpy(self):
+        if self._scrcpy_process and self._scrcpy_process.poll() is None:
+            self._stop_scrcpy()
+        else:
+            self._start_scrcpy()
+
+    def _start_scrcpy(self):
+        if not self._adb_cmd or not self._scrcpy_path:
+            messagebox.showinfo("流畅投屏", "请先安装 scrcpy（如 winget install scrcpy）。", parent=self)
             return
+        if not self._embedder:
+            messagebox.showinfo("流畅投屏", "嵌入式 scrcpy 目前只支持 Windows。", parent=self)
+            return
+
+        self.update_idletasks()
+        bit_rate = self._get_selected_bit_rate()
+        self._scrcpy_title = f"Gongju scrcpy {uuid.uuid4().hex}"
+        args = [
+            self._scrcpy_path,
+            "--no-audio",
+            "--window-title",
+            self._scrcpy_title,
+            "--window-borderless",
+            "--disable-screensaver",
+            "--max-size",
+            _SCRCPY_MAX_SIZE,
+            "--max-fps",
+            _SCRCPY_MAX_FPS,
+            "--video-bit-rate",
+            bit_rate,
+        ]
+        if self._serial:
+            args.extend(["-s", self._serial])
+
         try:
-            t = threading.Thread(
-                target=_run_pydroid_stream,
-                args=(self._adb_cmd, self._scrcpy_path),
-                daemon=True,
+            env = os.environ.copy()
+            if self._adb_cmd:
+                env["SCRCPY_ADB"] = self._adb_cmd
+            scrcpy_cwd = os.path.dirname(os.path.abspath(self._scrcpy_path)) if os.path.isfile(self._scrcpy_path) else None
+            self._scrcpy_process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=scrcpy_cwd,
+                env=env,
+                creationflags=_CREATIONFLAGS,
             )
-            t.start()
-            self._set_status("已启动视频流，请到 scrcpy 窗口查看并操作设备")
         except Exception as e:
             messagebox.showerror("启动失败", str(e), parent=self)
-
-    def _on_close(self):
-        if self._running:
-            self._stop_stream()
-        self.destroy()
-
-    def _toggle_stream(self):
-        if self._running:
-            self._stop_stream()
-        else:
-            self._start_stream()
-
-    def _start_stream(self):
-        if not self._adb_cmd:
             return
-        self._running = True
-        self._btn_toggle.configure(text="停止预览（截屏）")
-        self._hint.place_forget()
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self._thread.start()
-        self._set_status("预览中（约 %d 帧/秒）· 在画面中点击可操作设备" % _PREVIEW_FPS)
-        self._poll_queue()
 
-    def _stop_stream(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.5)
-            self._thread = None
-        self._btn_toggle.configure(text="开始预览（截屏）")
-        self._set_status("已停止")
-        try:
-            while True:
-                self._frame_queue.get_nowait()
-        except queue.Empty:
-            pass
+        self._hint.place_forget()
+        self._btn_scrcpy.configure(text="停止流畅投屏")
+        self._bit_rate_menu.configure(state="disabled")
+        self._set_status("正在启动 scrcpy 视频流...")
+        self.after(100, self._wait_and_embed_scrcpy, time.monotonic())
+
+    def _get_selected_bit_rate(self):
+        bit_rate = (self._bit_rate_var.get() or _SCRCPY_DEFAULT_BIT_RATE).strip()
+        return bit_rate if bit_rate in _SCRCPY_BIT_RATE_OPTIONS else _SCRCPY_DEFAULT_BIT_RATE
+
+    def _wait_and_embed_scrcpy(self, started_at):
+        if not self._scrcpy_process:
+            return
+        if self._scrcpy_process.poll() is not None:
+            self._set_status("scrcpy 已退出，请确认设备授权和 scrcpy 安装是否正常")
+            self._cleanup_scrcpy_ui()
+            return
+
+        hwnd = self._embedder.find_window(self._scrcpy_process.pid, self._scrcpy_title)
+        if hwnd:
+            self._scrcpy_hwnd = hwnd
+            parent_hwnd = self._canvas.winfo_id()
+            self._embedder.embed(hwnd, parent_hwnd, self._display_w, self._display_h)
+            self._set_status(f"流畅投屏中（scrcpy {_SCRCPY_MAX_FPS} FPS 上限，{self._get_selected_bit_rate()}）")
+            self.after(1000, self._monitor_scrcpy)
+            return
+
+        if time.monotonic() - started_at >= _SCRCPY_EMBED_TIMEOUT:
+            self._set_status("未能嵌入 scrcpy 窗口，已停止")
+            self._stop_scrcpy()
+            return
+        self.after(100, self._wait_and_embed_scrcpy, started_at)
+
+    def _monitor_scrcpy(self):
+        if not self._scrcpy_process:
+            return
+        if self._scrcpy_process.poll() is not None:
+            self._scrcpy_process = None
+            self._scrcpy_hwnd = None
+            self._scrcpy_title = None
+            self._cleanup_scrcpy_ui()
+            self._set_status("scrcpy 已退出")
+            return
+        self.after(1000, self._monitor_scrcpy)
+
+    def _stop_scrcpy(self):
+        proc = self._scrcpy_process
+        self._scrcpy_process = None
+        self._scrcpy_hwnd = None
+        self._scrcpy_title = None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._cleanup_scrcpy_ui()
+        self._set_status("流畅投屏已停止")
+
+    def _cleanup_scrcpy_ui(self):
+        self._btn_scrcpy.configure(text="启动流畅投屏")
+        self._bit_rate_menu.configure(state="normal")
         self._hint.place(relx=0.5, rely=0.5, anchor="center")
 
-    def _capture_loop(self):
-        interval = 1.0 / _PREVIEW_FPS
-        while self._running and self._adb_cmd:
-            t0 = time.monotonic()
-            result = capture_one_png(self._adb_cmd)
-            if result is None:
-                time.sleep(interval)
-                continue
-            img, orig_w, orig_h = result
-            dw = getattr(self, "_display_w", 800)
-            dh = getattr(self, "_display_h", 600)
-            if dw <= 0 or dh <= 0:
-                dw, dh = 800, 600
-            iw, ih = img.size
-            scale = min(dw / iw, dh / ih) if (iw and ih) else 1.0
-            nw, nh = int(iw * scale), int(ih * scale)
-            if nw <= 0 or nh <= 0:
-                time.sleep(interval)
-                continue
-            resized = img.resize((nw, nh), Image.Resampling.BILINEAR)
-            payload = (resized, orig_w, orig_h, nw, nh)
-            try:
-                self._frame_queue.put_nowait(payload)
-            except queue.Full:
-                try:
-                    self._frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                self._frame_queue.put_nowait(payload)
-            elapsed = time.monotonic() - t0
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
-
-    def _poll_queue(self):
-        if not self._running:
-            return
-        try:
-            payload = self._frame_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            resized, self._orig_w, self._orig_h, self._shown_w, self._shown_h = payload
-            w, h = self._display_w, self._display_h
-            self._offset_x = (w - self._shown_w) // 2
-            self._offset_y = (h - self._shown_h) // 2
-            self._photo = resized
-            if self._photo:
-                self._photo_tk = ImageTk.PhotoImage(self._photo)
-                self._canvas.delete("all")
-                self._canvas.create_image(
-                    self._offset_x, self._offset_y,
-                    image=self._photo_tk, anchor="nw",
-                )
-            if not self._device_size and self._orig_w and self._orig_h:
-                self._device_size = (self._orig_w, self._orig_h)
-        self.after(_POLL_MS, self._poll_queue)
-
-    def _on_click(self, event):
-        if not self._running or not self._adb_cmd or not self._shown_w or not self._shown_h:
-            return
-        scale = self._orig_w / self._shown_w if self._shown_w else 1.0
-        dx = (event.x - self._offset_x) * scale
-        dy = (event.y - self._offset_y) * scale
-        if self._device_size:
-            dw, dh = self._device_size
-            dx = max(0, min(dw - 1, dx))
-            dy = max(0, min(dh - 1, dy))
-        send_tap(self._adb_cmd, dx, dy)
+    def _on_close(self):
+        if self._scrcpy_process and self._scrcpy_process.poll() is None:
+            self._stop_scrcpy()
+        self.destroy()

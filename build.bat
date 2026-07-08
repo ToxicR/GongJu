@@ -6,8 +6,17 @@ echo 正在安装打包工具 PyInstaller...
 python -m pip install pyinstaller -q
 
 echo.
+echo 正在准备内置 scrcpy...
+python prepare_scrcpy.py
+if %errorlevel% neq 0 (
+    echo 准备 scrcpy 失败。
+    pause
+    exit /b 1
+)
+
+echo.
 echo 正在打包为独立 exe（不依赖 Python）...
-pyinstaller --onefile --windowed --name "工具软件" --clean --add-data "bundled/platform-tools;bundled/platform-tools" main.py
+pyinstaller --onefile --windowed --name "工具软件" --clean --add-data "bundled/platform-tools;bundled/platform-tools" --add-data "bundled/scrcpy;bundled/scrcpy" main.py
 
 if %errorlevel% neq 0 (
     echo 打包失败。
